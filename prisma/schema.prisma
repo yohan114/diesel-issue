@@ -1,0 +1,206 @@
+// Fleet Fuel Management — data model (SQLite)
+// NOTE: SQLite does not support Prisma native enums, so enum-like columns are
+// String and validated in TypeScript via Zod (see src/lib/enums.ts). Money is
+// stored as integer LKR cents to avoid float drift.
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------- Users -----------------------------
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String?  @unique
+  name         String
+  passwordHash String
+  role         String   @default("USER") // ADMIN | USER
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  createdById  String?
+  createdBy    User?    @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers User[]   @relation("UserCreatedBy")
+
+  fuelRequestsMade     FuelRequest[]  @relation("RequestedBy")
+  fuelRequestsReviewed FuelRequest[]  @relation("ReviewedBy")
+  fuelIssuesMade       FuelIssue[]    @relation("IssuedBy")
+  meterReadings        MeterReading[] @relation("RecordedBy")
+  pricesEntered        FuelPrice[]    @relation("EnteredBy")
+  auditLogs            AuditLog[]
+
+  @@index([role])
+}
+
+// --------------------------- Categories --------------------------
+model Category {
+  id               String   @id @default(cuid())
+  code             String   @unique // DT, HEX, VR, MB, ...
+  name             String
+  defaultMeterType String // KM | HOURS
+  fleetGroup       String // ROAD_VEHICLE | MACHINERY_GENSET
+  createdAt        DateTime @default(now())
+
+  assets Asset[]
+}
+
+// ----------------------------- Assets ----------------------------
+model Asset {
+  id        String  @id @default(cuid())
+  code      String  @unique // E&C number (unique asset code)
+  brand     String?
+  typeLabel String? // raw TYPE text from the Excel
+  model     String?
+  regNo     String?
+  capacity  String?
+  yom       Int? // year of manufacture
+  chassisNo String?
+  engineNo  String?
+  serialNo  String?
+  site      String?
+  status    String  @default("ACTIVE") // ACTIVE | INACTIVE | DISPOSED
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+  meterType  String // KM | HOURS (defaulted from category, admin-overridable)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  fuelRequests  FuelRequest[]
+  fuelIssues    FuelIssue[]
+  meterReadings MeterReading[]
+
+  @@index([categoryId])
+  @@index([status])
+  @@index([meterType])
+}
+
+// ------------------------ Fuel price history ---------------------
+model FuelPrice {
+  id            String   @id @default(cuid())
+  fuelKind      String // AUTO_DIESEL | SUPER_DIESEL
+  pricePerLitre Int // LKR cents per litre (40700 = Rs.407.00)
+  effectiveFrom DateTime
+  source        String   @default("MANUAL") // CEYPETCO | AGGREGATOR | MANUAL
+  note          String?
+  createdAt     DateTime @default(now())
+
+  enteredById String?
+  enteredBy   User?   @relation("EnteredBy", fields: [enteredById], references: [id])
+
+  fuelIssues FuelIssue[]
+
+  @@unique([fuelKind, effectiveFrom])
+  @@index([fuelKind, effectiveFrom])
+}
+
+// ----------------------- Fuel requests (mode B) ------------------
+model FuelRequest {
+  id              String   @id @default(cuid())
+  fuelKind        String // AUTO_DIESEL | SUPER_DIESEL
+  requestedLitres Float
+  meterReading    Float?
+  readingType     String? // KM | HOURS
+  reason          String?
+  status          String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  reviewedAt      DateTime?
+  reviewNote      String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  assetId String
+  asset   Asset  @relation(fields: [assetId], references: [id])
+
+  requestedById String
+  requestedBy   User   @relation("RequestedBy", fields: [requestedById], references: [id])
+  reviewedById  String?
+  reviewedBy    User?  @relation("ReviewedBy", fields: [reviewedById], references: [id])
+
+  issue FuelIssue?
+
+  @@index([status])
+  @@index([assetId, createdAt])
+  @@index([requestedById])
+}
+
+// -------------- Fuel issues (mode A direct, or from request) -----
+model FuelIssue {
+  id            String   @id @default(cuid())
+  fuelKind      String // AUTO_DIESEL | SUPER_DIESEL
+  litres        Float
+  meterReading  Float?
+  readingType   String? // KM | HOURS
+  pricePerLitre Int // LKR cents snapshot (price effective on issueDate)
+  totalCost     Int // LKR cents = round(litres * pricePerLitre)
+  source        String? // station / bowser identifier
+  issueDate     DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  assetId String
+  asset   Asset  @relation(fields: [assetId], references: [id])
+
+  fuelPriceId String?
+  fuelPrice   FuelPrice? @relation(fields: [fuelPriceId], references: [id])
+
+  issuedById String
+  issuedBy   User   @relation("IssuedBy", fields: [issuedById], references: [id])
+
+  linkedRequestId String?      @unique
+  linkedRequest   FuelRequest? @relation(fields: [linkedRequestId], references: [id])
+
+  @@index([assetId, issueDate])
+  @@index([fuelKind, issueDate])
+  @@index([issueDate])
+}
+
+// ------------ Meter readings (running-total source of truth) -----
+model MeterReading {
+  id            String   @id @default(cuid())
+  value         Float // cumulative odometer (km) or hour-meter (hours)
+  readingType   String // KM | HOURS
+  readingDate   DateTime
+  source        String   @default("MANUAL") // MANUAL | FUEL_ISSUE
+  sourceIssueId String?
+  createdAt     DateTime @default(now())
+
+  assetId String
+  asset   Asset  @relation(fields: [assetId], references: [id])
+
+  recordedById String
+  recordedBy   User   @relation("RecordedBy", fields: [recordedById], references: [id])
+
+  @@index([assetId, readingDate])
+  @@index([assetId, readingType, readingDate])
+}
+
+// ----------------------------- Audit log -------------------------
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String // CREATE | UPDATE | DELETE | APPROVE | REJECT | LOGIN | PRICE_REFRESH | BACKUP
+  entity    String
+  entityId  String?
+  summary   String?
+  metaJson  String?
+  createdAt DateTime @default(now())
+
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+}
+
+// ----------------------------- Settings --------------------------
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
